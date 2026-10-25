@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary media & export files
+*.raw_video.mp4
+*.raw_audio.wav
+*.mp4
+*.wav
+*.gif
+*.png
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
