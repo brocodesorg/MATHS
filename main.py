@@ -1,7 +1,7 @@
 # Requirements: PyQt6 numpy sympy matplotlib sounddevice
 """
 The Sound Of Mathematics: Animated function visualizer with synchronized real-time audio.
-Strictly 2D graphing with a draggable and minimizable scientific calculator overlay.
+Strictly 2D graphing supporting polar flower equations, parametric curves, implicit geometry, and Cartesian functions.
 """
 from __future__ import annotations
 import os, re, sys, time, warnings
@@ -31,31 +31,32 @@ except Exception:
 
 
 class FormulaParser:
-    """Preprocesses and parses math expressions supporting x, y, and z."""
+    """Preprocesses and parses math expressions supporting x, y, z, theta, r, and t."""
     FUNCS = {
         "sin": sp.sin, "cos": sp.cos, "tan": sp.tan, "asin": sp.asin, "acos": sp.acos,
         "atan": sp.atan, "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh, "ln": sp.log,
         "log": sp.log, "exp": sp.exp, "sqrt": sp.sqrt, "Abs": sp.Abs, "abs": sp.Abs,
         "floor": sp.floor, "ceil": sp.ceiling, "ceiling": sp.ceiling, "sign": sp.sign, "sinc": sp.sinc
     }
-    X, Y, Z = sp.Symbol("x", real=True), sp.Symbol("y", real=True), sp.Symbol("z", real=True)
-    WORDS = {"x", "y", "z", "pi", "e", "E", *FUNCS.keys()}
+    X = sp.Symbol("x", real=True)
+    Y = sp.Symbol("y", real=True)
+    Z = sp.Symbol("z", real=True)
+    THETA = sp.Symbol("theta", real=True)
+    T = sp.Symbol("t", real=True)
+    R = sp.Symbol("r", real=True)
+
+    WORDS = {"x", "y", "z", "theta", "t", "r", "pi", "e", "E", *FUNCS.keys()}
     TRANSFORMS = standard_transformations + (implicit_multiplication_application, convert_xor)
-    LOCAL_DICT = {"x": X, "y": Y, "z": Z, "pi": sp.pi, "e": sp.E, "E": sp.E, **FUNCS}
+    LOCAL_DICT = {
+        "x": X, "y": Y, "z": Z, "theta": THETA, "t": T, "r": R,
+        "pi": sp.pi, "e": sp.E, "E": sp.E, **FUNCS
+    }
 
     @classmethod
-    def preprocess(cls, text: str) -> str:
-        """Sanitizes text, converting equations, LaTeX, Unicode, and powers into valid syntax."""
+    def preprocess_str(cls, text: str) -> str:
+        """Sanitizes text, handling LaTeX, Unicode, implicit operations, and powers."""
         s = text.strip()
-        if "=" in s:
-            left, right = s.split("=", 1)
-            left, right = left.strip(), right.strip()
-            if left in ["y", "f(x)", "z", "f(x,y)", "f(x, y)", "f"]:
-                s = right
-            elif re.match(r"^[a-zA-Z](\([a-zA-Z,\s]*\))?$", left):
-                s = right
-            else:
-                s = f"(({left}) - ({right}))"
+        s = s.replace("θ", "theta").replace("\\theta", "theta")
         s = s.replace("×", "*").replace("÷", "/").replace("π", "pi").replace("−", "-").replace("²", "**2").replace("³", "**3")
         s = re.sub(r"√\s*\(([^)]+)\)", r"sqrt(\1)", s)
         s = re.sub(r"√\s*([a-zA-Z0-9_]+)", r"sqrt(\1)", s)
@@ -71,31 +72,102 @@ class FormulaParser:
         return re.sub(r"\be\s*\*\*\s*([a-zA-Z0-9_]+)", r"exp(\1)", s)
 
     @classmethod
-    def parse(cls, formula_str: str) -> tuple[sp.Expr, str, Callable, list[str]]:
-        """Compiles expression into sympy object, display latex, and numpy evaluation function."""
-        cleaned = cls.preprocess(formula_str)
-        if not cleaned: raise ValueError("Formula cannot be empty")
-        if any(bad in cleaned for bad in [";", ":", "__"]): raise ValueError("Forbidden syntax (; : __)")
-        for w in re.findall(r"[a-zA-Z_]\w*", cleaned):
+    def parse_any(cls, text: str) -> tuple[str, dict]:
+        """
+        Classifies and parses user formula into one of:
+        - POLAR: r = f(theta)
+        - PARAMETRIC: x = f(t), y = g(t)
+        - IMPLICIT_2D: f(x, y) = 0
+        - SLICE_3D: f(x, y, z) = 0
+        - CARTESIAN_1D: y = f(x)
+        """
+        raw = cls.preprocess_str(text)
+        if not raw: raise ValueError("Formula cannot be empty")
+        if any(bad in raw for bad in [":", "__"]): raise ValueError("Forbidden syntax (: __)")
+
+        # 1. PARAMETRIC CHECK (x = ..., y = ...)
+        clean_param = raw.replace(";", ",").replace("\n", ",")
+        clean_param = re.sub(r"\b[Xx]\s*(?:equation\s*)?=", "x =", clean_param)
+        clean_param = re.sub(r"\b[Yy]\s*(?:equation\s*)?=", "y =", clean_param)
+        if ("x =" in clean_param or "x=" in clean_param) and ("y =" in clean_param or "y=" in clean_param):
+            parts = [p.strip() for p in clean_param.split(",") if "=" in p]
+            x_str, y_str = None, None
+            for p in parts:
+                side, val = p.split("=", 1)
+                side = side.strip().lower()
+                if side == "x": x_str = val.strip()
+                elif side == "y": y_str = val.strip()
+            if x_str and y_str:
+                for w in re.findall(r"[a-zA-Z_]\w*", x_str + " " + y_str):
+                    if w not in cls.WORDS: raise ValueError(f"Unknown identifier '{w}'")
+                ex = parse_expr(x_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
+                ey = parse_expr(y_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
+                param = cls.T if cls.T in (ex.free_symbols | ey.free_symbols) else cls.THETA
+                lam_x = sp.lambdify(param, ex, modules=["numpy"])
+                lam_y = sp.lambdify(param, ey, modules=["numpy"])
+                lat_x = sp.latex(ex).replace(r"\left", "").replace(r"\right", "")
+                lat_y = sp.latex(ey).replace(r"\left", "").replace(r"\right", "")
+                latex_str = f"x({param.name})={lat_x}, y({param.name})={lat_y}"
+                return "PARAMETRIC", {"lam_x": lam_x, "lam_y": lam_y, "latex": latex_str, "param": param.name}
+
+        # 2. POLAR CHECK (r = ... or contains theta)
+        if raw.startswith("r =") or raw.startswith("r=") or "theta" in raw:
+            r_str = raw.split("=", 1)[1].strip() if "=" in raw else raw
+            for w in re.findall(r"[a-zA-Z_]\w*", r_str):
+                if w not in cls.WORDS: raise ValueError(f"Unknown identifier '{w}'")
+            er = parse_expr(r_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
+            param = cls.THETA if (cls.THETA in er.free_symbols or cls.T not in er.free_symbols) else cls.T
+            lam_r = sp.lambdify(param, er, modules=["numpy"])
+            raw_lat = sp.latex(er).replace(r"\left", "").replace(r"\right", "")
+            latex_str = f"r({param.name}) = {raw_lat}"
+            return "POLAR", {"lam_r": lam_r, "latex": latex_str, "param": param.name}
+
+        # 3. EQUATION / IMPLICIT / CARTESIAN FORM
+        eq_str = raw
+        if "=" in eq_str:
+            left, right = eq_str.split("=", 1)
+            left, right = left.strip(), right.strip()
+            if left in ["y", "f(x)", "z", "f(x,y)", "f(x, y)", "f"]:
+                eq_str = right
+            elif re.match(r"^[a-zA-Z](\([a-zA-Z,\s]*\))?$", left):
+                eq_str = right
+            else:
+                eq_str = f"(({left}) - ({right}))"
+
+        for w in re.findall(r"[a-zA-Z_]\w*", eq_str):
             if w not in cls.WORDS: raise ValueError(f"Unknown identifier '{w}'")
-        expr = parse_expr(cleaned, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
-        allowed_syms = {cls.X, cls.Y, cls.Z}
-        for sym in expr.free_symbols:
-            if sym not in allowed_syms: raise ValueError(f"Unknown variable '{sym}', only x, y, z allowed")
-        for atom in expr.atoms(sp.Function):
-            if atom.func not in set(cls.FUNCS.values()): raise ValueError(f"Disallowed function '{atom.func}'")
+        expr = parse_expr(eq_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
+        free = expr.free_symbols
 
-        var_order = [cls.X, cls.Y, cls.Z]
-        used_vars = [s for s in var_order if s in expr.free_symbols]
-        if not used_vars: used_vars = [cls.X]
-        var_names = [s.name for s in used_vars]
+        # 3-variable slice
+        if cls.Z in free and cls.Y in free:
+            lam = sp.lambdify((cls.X, cls.Y, cls.Z), expr, modules=["numpy"])
+            lat = sp.latex(expr).replace(r"\left", "").replace(r"\right", "")
+            return "SLICE_3D", {"lam": lam, "latex": f"f(x, y, z) = {lat} = 0"}
 
-        lam = sp.lambdify(tuple(used_vars), expr, modules=["numpy"])
-        raw_latex = sp.latex(expr).replace(r"\left", "").replace(r"\right", "")
-        if len(var_names) == 1: latex_str = f"f({var_names[0]}) = {raw_latex}"
-        elif len(var_names) == 2: latex_str = f"f(x, y) = {raw_latex} = 0"
-        else: latex_str = f"f(x, y, z) = {raw_latex} = 0"
-        return expr, latex_str, lam, var_names
+        # 2-variable implicit
+        if (cls.X in free and cls.Y in free) or ("=" in raw and cls.X in free):
+            lam = sp.lambdify((cls.X, cls.Y), expr, modules=["numpy"])
+            lat = sp.latex(expr).replace(r"\left", "").replace(r"\right", "")
+            return "IMPLICIT_2D", {"lam": lam, "latex": f"f(x, y) = {lat} = 0"}
+
+        # 1-variable Cartesian (x or t)
+        var = cls.T if (cls.T in free and cls.X not in free) else cls.X
+        lam = sp.lambdify(var, expr, modules=["numpy"])
+        lat = sp.latex(expr).replace(r"\left", "").replace(r"\right", "")
+        return "CARTESIAN_1D", {"lam": lam, "latex": f"f({var.name}) = {lat}", "var": var.name}
+
+
+def parse_bound(val_str: str, default: float) -> float:
+    """Parses numeric or symbolic bounds like '0', '2*pi', '2pi', '4*pi', 'pi', '-6.0'."""
+    s = val_str.strip().replace("π", "pi").replace("θ", "theta")
+    if not s: return default
+    try:
+        trans = standard_transformations + (implicit_multiplication_application,)
+        e = parse_expr(s, local_dict={"pi": sp.pi, "e": sp.E}, transformations=trans)
+        return float(e.evalf())
+    except Exception:
+        return float(s)
 
 
 class AudioEngine:
@@ -250,12 +322,15 @@ class GraphAnimator:
         self.dot_glow, = self.ax.plot([], [], marker="o", markersize=14, color=self.color, alpha=0.35, ls="")
         self.dot_main, = self.ax.plot([], [], marker="o", markersize=6, color="white", alpha=1.0, ls="")
         self.drop_line, = self.ax.plot([], [], color="white", ls="--", lw=1.0, alpha=0.35)
-        self.formula_text = self.fig.text(0.5, 0.03, f"${latex_str}$", color=self.color, fontsize=13, ha="center", va="bottom", weight="bold")
+        try:
+            self.formula_text = self.fig.text(0.5, 0.03, f"${latex_str}$", color=self.color, fontsize=13, ha="center", va="bottom", weight="bold")
+        except Exception:
+            self.formula_text = self.fig.text(0.5, 0.03, latex_str, color=self.color, fontsize=11, ha="center", va="bottom", weight="bold")
         self.canvas.draw_idle()
 
     def start_animation_trace(self, xs: np.ndarray, ys: np.ndarray, duration: float,
                               get_progress: Callable[[], float], on_finish: Callable[[], None]) -> None:
-        """Starts 2D progressive curve tracing loop (for 1D explicit curves & 2D implicit circles)."""
+        """Starts 2D progressive curve tracing loop (for polar flowers, parametric curves & Cartesian graphs)."""
         if self.anim is not None and self.anim.event_source is not None: self.anim.event_source.stop()
         self.xs, self.ys, self.duration = xs, ys, duration
         self.is_3d_slice_mode = False
@@ -358,7 +433,6 @@ class DraggableKeypad(QFrame):
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setSpacing(4)
 
-        # Draggable Header Bar
         hdr = QHBoxLayout()
         hdr.setContentsMargins(2, 0, 2, 2)
         lbl = QLabel("⠿ Calculator (Drag anywhere)")
@@ -379,7 +453,6 @@ class DraggableKeypad(QFrame):
         hdr.addWidget(self.btn_close)
         layout.addLayout(hdr)
 
-        # Keypad Grid Body
         self.body = QWidget()
         grid = QGridLayout(self.body)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -392,16 +465,18 @@ class DraggableKeypad(QFrame):
             ["floor", "ceil", "(", ")", "^", "π", "e"],
             ["7", "8", "9", "÷", "×", "−", "+"],
             ["4", "5", "6", "1", "2", "3", "."],
-            ["0", "x", "y", "z", "Plot ▶"]
+            ["0", "=", ",", "x", "y", "z", "θ"],
+            ["r", "t", "r =", "2π", "( )", "x =", "y ="],
+            ["Plot ▶"]
         ]
         for r, row in enumerate(buttons):
             for c, text in enumerate(row):
                 btn = QPushButton(text, focusPolicy=Qt.FocusPolicy.NoFocus)
-                btn.setFixedHeight(26)
+                btn.setFixedHeight(24)
                 if text == "Plot ▶":
-                    btn.setStyleSheet("background-color: #FFD700; color: #000; font-weight: bold;")
+                    btn.setStyleSheet("background-color: #FFD700; color: #000; font-weight: bold; font-size: 12px;")
                     btn.clicked.connect(self.on_plot)
-                    grid.addWidget(btn, r, c, 1, 3)
+                    grid.addWidget(btn, r, 0, 1, 7)
                 elif text in ["DEL", "CLEAR"]:
                     btn.setStyleSheet("background-color: #700000; color: #fff;")
                     btn.clicked.connect(lambda _, t=text: self.on_insert(t))
@@ -437,16 +512,29 @@ class DraggableKeypad(QFrame):
 
 
 class MainWindow(QMainWindow):
-    """Main window with dark theme, floating draggable keypad, and unobstructed 2D visualizer."""
-    PRESETS = [
-        "x^2+y^2-1", "sin(4x)/x", "x^2+y^2+z^2-1", "sin(x^2)",
-        "cos(3x)+sin(8x)", "x^2/4+y^2/9-1", "e^(x/4)*sin(6x)", "x*sin(1/x)"
+    """Main window with dark theme, floating draggable keypad, and strictly 2D visualizer."""
+    FLOWER_PRESETS = [
+        ("🌺 Lotus", "r = 5*sin(12*theta) + 2*sin(24*theta)", "0", "2*pi"),
+        ("🌹 Rose", "r = 8*cos(8*theta)", "0", "2*pi"),
+        ("🌻 Complex", "r = 5 + 2*sin(12*theta) + 1.5*cos(24*theta) + 0.8*sin(36*theta)", "0", "2*pi"),
+        ("💮 Blossom", "r = 4*sin(7*theta) + 2*cos(14*theta) + sin(21*theta) + 0.5*cos(42*theta)", "0", "2*pi"),
+        ("👑 Parametric", "x = (5 + 2*cos(12*t) + sin(24*t))*cos(t), y = (5 + 2*cos(12*t) + sin(24*t))*sin(t)", "0", "2*pi"),
+        ("🌸 4-Petal", "(x*x + y*y)^3 = 4*x*x*y*y", "-1.5", "1.5")
+    ]
+    CLASSIC_PRESETS = [
+        ("⭕ Circle", "x^2+y^2-1", "-2.5", "2.5"),
+        ("〰️ Sinc", "sin(4x)/x", "-6.0", "6.0"),
+        ("Wave", "cos(3x)+sin(8x)", "-6.0", "6.0"),
+        ("Chirp", "sin(x^2)", "-6.0", "6.0"),
+        ("Damped", "e^(x/4)*sin(6x)", "-6.0", "6.0"),
+        ("Singular", "x*sin(1/x)", "-1.5", "1.5"),
+        ("🔮 Sphere", "x^2+y^2+z^2-1", "-2.0", "2.0")
     ]
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("The Sound Of Mathematics")
-        self.resize(760, 960); self.setMinimumSize(640, 720)
+        self.resize(780, 960); self.setMinimumSize(660, 720)
         self.setStyleSheet("""
             QMainWindow, QWidget { background-color: #000000; color: #d0d0d0; font-family: 'Segoe UI', Arial; }
             QLineEdit, QComboBox { background-color: #141414; color: #fff; border: 1px solid #333; border-radius: 4px; padding: 4px 6px; }
@@ -461,12 +549,12 @@ class MainWindow(QMainWindow):
         self.history: list[str] = []
 
         self._build_ui()
-        # Initialize floating draggable keypad overlay
         self.keypad = DraggableKeypad(self, on_insert=self._on_keypad_press, on_plot=self.plot_formula)
-        self.keypad.move(self.width() - 370, 115)
+        self.keypad.move(self.width() - 380, 115)
         self.keypad.show()
 
-        self.load_preset("x^2+y^2-1")
+        # Load first preset: Royal Lotus Flower
+        self.load_preset(self.FLOWER_PRESETS[0][1], self.FLOWER_PRESETS[0][2], self.FLOWER_PRESETS[0][3])
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -481,10 +569,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         inp_box = QHBoxLayout()
-        self.fx_lbl = QLabel("f ="); self.fx_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold)); self.fx_lbl.setStyleSheet("color: #FFD700;")
+        self.fx_lbl = QLabel("Formula:"); self.fx_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold)); self.fx_lbl.setStyleSheet("color: #FFD700;")
         inp_box.addWidget(self.fx_lbl)
-        self.formula_input = QLineEdit(); self.formula_input.setPlaceholderText("e.g. x^2+y^2-1, sin(4x)/x, x^2+y^2+z^2-1...")
-        self.formula_input.returnPressed.connect(self.plot_formula); inp_box.addWidget(self.formula_input)
+        self.formula_input = QLineEdit()
+        self.formula_input.setPlaceholderText("e.g. r = 5*sin(12*theta) + 2*sin(24*theta), x^2+y^2-1, sin(4x)/x...")
+        self.formula_input.returnPressed.connect(self.plot_formula)
+        self.formula_input.textChanged.connect(self._on_formula_text_changed)
+        inp_box.addWidget(self.formula_input)
 
         self.btn_plot = QPushButton("Plot ▶"); self.btn_plot.setStyleSheet("background-color: #FFD700; color: #000; font-weight: bold; padding: 6px 14px;")
         self.btn_plot.clicked.connect(self.plot_formula); inp_box.addWidget(self.btn_plot)
@@ -499,14 +590,43 @@ class MainWindow(QMainWindow):
         self.error_label = QLabel(""); self.error_label.setStyleSheet("color: #FF4D4D; font-size: 11px; font-weight: bold;")
         self.error_label.setVisible(False); layout.addWidget(self.error_label)
 
+        # Controls & Parameters bar
         ctrl_bar = QHBoxLayout()
-        for lbl, dval, w, attr in [("x min:", "-3.0", 44, "inp_xmin"), ("x max:", "3.0", 44, "inp_xmax"), ("Duration (s):", "8.0", 40, "inp_dur")]:
-            ctrl_bar.addWidget(QLabel(lbl)); le = QLineEdit(dval); le.setMaximumWidth(w); setattr(self, attr, le); ctrl_bar.addWidget(le)
+        self.lbl_min = QLabel("θ min:")
+        ctrl_bar.addWidget(self.lbl_min)
+        self.inp_xmin = QLineEdit("0")
+        self.inp_xmin.setMaximumWidth(46)
+        ctrl_bar.addWidget(self.inp_xmin)
+
+        self.lbl_max = QLabel("max:")
+        ctrl_bar.addWidget(self.lbl_max)
+        self.inp_xmax = QLineEdit("2*pi")
+        self.inp_xmax.setMaximumWidth(52)
+        ctrl_bar.addWidget(self.inp_xmax)
+
+        # Quick range shortcut buttons
+        btn_r_2pi = QPushButton("0→2π", focusPolicy=Qt.FocusPolicy.NoFocus)
+        btn_r_2pi.setToolTip("Set angle/t range from 0 to 2*pi (for Polar Flowers & Parametric curves)")
+        btn_r_2pi.setStyleSheet("background-color: #202020; color: #FFD700; font-size: 10px; padding: 2px 5px; border: 1px solid #444;")
+        btn_r_2pi.clicked.connect(lambda: (self.inp_xmin.setText("0"), self.inp_xmax.setText("2*pi"), self.plot_formula()))
+        ctrl_bar.addWidget(btn_r_2pi)
+
+        btn_r_6 = QPushButton("±6", focusPolicy=Qt.FocusPolicy.NoFocus)
+        btn_r_6.setToolTip("Set Cartesian x range from -6 to 6")
+        btn_r_6.setStyleSheet("background-color: #202020; color: #00FFFF; font-size: 10px; padding: 2px 5px; border: 1px solid #444;")
+        btn_r_6.clicked.connect(lambda: (self.inp_xmin.setText("-6.0"), self.inp_xmax.setText("6.0"), self.plot_formula()))
+        ctrl_bar.addWidget(btn_r_6)
+
+        ctrl_bar.addWidget(QLabel("Dur (s):"))
+        self.inp_dur = QLineEdit("8.0")
+        self.inp_dur.setMaximumWidth(38)
+        ctrl_bar.addWidget(self.inp_dur)
+
         ctrl_bar.addWidget(QLabel("Sound:"))
         self.combo_mode = QComboBox(); self.combo_mode.addItems(["Pitch", "Pitch+Harmonics", "Stereo pan by x"])
         self.combo_mode.currentTextChanged.connect(lambda m: setattr(self.audio_engine, "mode", m)); ctrl_bar.addWidget(self.combo_mode)
         ctrl_bar.addWidget(QLabel("Vol:"))
-        self.slider_vol = QSlider(Qt.Orientation.Horizontal); self.slider_vol.setRange(0, 100); self.slider_vol.setValue(75); self.slider_vol.setMaximumWidth(70)
+        self.slider_vol = QSlider(Qt.Orientation.Horizontal); self.slider_vol.setRange(0, 100); self.slider_vol.setValue(75); self.slider_vol.setMaximumWidth(65)
         self.slider_vol.valueChanged.connect(lambda v: setattr(self.audio_engine, "volume", v / 100.0)); ctrl_bar.addWidget(self.slider_vol)
         layout.addLayout(ctrl_bar)
 
@@ -519,13 +639,29 @@ class MainWindow(QMainWindow):
         self.combo_history.currentTextChanged.connect(lambda t: self.load_preset(t) if t else None); act_bar.addWidget(self.combo_history)
         layout.addLayout(act_bar)
 
-        pre_bar = QHBoxLayout(); pre_bar.addWidget(QLabel("Presets:", styleSheet="color: #FFD700; font-weight: bold;"))
-        for p in self.PRESETS:
-            b = QPushButton(p, focusPolicy=Qt.FocusPolicy.NoFocus, styleSheet="padding: 3px 6px; font-size: 11px;")
-            b.clicked.connect(lambda _, f=p: self.load_preset(f)); pre_bar.addWidget(b)
-        layout.addLayout(pre_bar)
+        # Flower Presets Bar
+        flowers_bar = QHBoxLayout()
+        flowers_lbl = QLabel("Flowers:"); flowers_lbl.setStyleSheet("color: #FF1493; font-weight: bold; font-size: 11px;")
+        flowers_bar.addWidget(flowers_lbl)
+        for label, formula, b_min, b_max in self.FLOWER_PRESETS:
+            b = QPushButton(label, focusPolicy=Qt.FocusPolicy.NoFocus)
+            b.setStyleSheet("padding: 2px 5px; font-size: 11px; border: 1px solid #444;")
+            b.clicked.connect(lambda _, f=formula, mn=b_min, mx=b_max: self.load_preset(f, mn, mx))
+            flowers_bar.addWidget(b)
+        layout.addLayout(flowers_bar)
 
-        # Main 2D Graph Canvas - Takes maximum window space
+        # Classic Math Presets Bar
+        classic_bar = QHBoxLayout()
+        classic_lbl = QLabel("Classic:"); classic_lbl.setStyleSheet("color: #00FFFF; font-weight: bold; font-size: 11px;")
+        classic_bar.addWidget(classic_lbl)
+        for label, formula, b_min, b_max in self.CLASSIC_PRESETS:
+            b = QPushButton(label, focusPolicy=Qt.FocusPolicy.NoFocus)
+            b.setStyleSheet("padding: 2px 5px; font-size: 11px; border: 1px solid #444;")
+            b.clicked.connect(lambda _, f=formula, mn=b_min, mx=b_max: self.load_preset(f, mn, mx))
+            classic_bar.addWidget(b)
+        layout.addLayout(classic_bar)
+
+        # Strictly 2D Graph Canvas
         self.fig = Figure(figsize=(6, 5.4), facecolor="black")
         self.canvas = FigureCanvasQTAgg(self.fig)
         layout.addWidget(self.canvas, stretch=1)
@@ -545,9 +681,22 @@ class MainWindow(QMainWindow):
         else:
             self.keypad.hide()
 
+    def _on_formula_text_changed(self, text: str) -> None:
+        """Dynamically updates the range labels depending on whether formula uses theta, t, or x."""
+        t = text.lower()
+        if "theta" in t or "θ" in t or t.startswith("r =") or t.startswith("r="):
+            self.lbl_min.setText("θ min:"); self.lbl_max.setText("θ max:")
+        elif "t" in t and ("x=" in t or "y=" in t or "x =" in t or "y =" in t):
+            self.lbl_min.setText("t min:"); self.lbl_max.setText("t max:")
+        else:
+            self.lbl_min.setText("x min:"); self.lbl_max.setText("x max:")
+
     def _on_keypad_press(self, text: str) -> None:
         inp = self.formula_input
-        inserts = {"DEL": None, "CLEAR": None, "a/b": "()/()", "|x|": "|x|", "x²": "^2", "1/x": "1/x", "√": "sqrt("}
+        inserts = {
+            "DEL": None, "CLEAR": None, "a/b": "()/()", "( )": "()", "|x|": "|x|", "x²": "^2", "1/x": "1/x",
+            "√": "sqrt(", "θ": "theta", "2π": "2*pi", "r =": "r = ", "x =": "x = ", "y =": "y = "
+        }
         if text == "DEL": inp.backspace()
         elif text == "CLEAR": inp.clear()
         elif text in inserts: inp.insert(inserts[text])
@@ -556,34 +705,118 @@ class MainWindow(QMainWindow):
         else: inp.insert(text)
         inp.setFocus()
 
-    def load_preset(self, formula: str) -> None:
-        self.formula_input.setText(formula); self.plot_formula()
+    def load_preset(self, formula: str, b_min: Optional[str] = None, b_max: Optional[str] = None) -> None:
+        """Loads a preset formula with its optimal range and executes plot immediately."""
+        self.formula_input.setText(formula)
+        if b_min is not None: self.inp_xmin.setText(b_min)
+        if b_max is not None: self.inp_xmax.setText(b_max)
+        self.plot_formula()
 
     def plot_formula(self) -> None:
-        """Parses formula, plots 2D curves/slices, and synchronizes real-time sound."""
+        """Parses polar flower, parametric, implicit or Cartesian formulas and runs 2D animation with sound."""
         text = self.formula_input.text().strip()
         if not text: return
         try:
-            expr, latex_str, lam, var_names = FormulaParser.parse(text)
+            mode, res = FormulaParser.parse_any(text)
             self.error_label.setVisible(False)
-            self.fx_lbl.setText(f"f({','.join(var_names)}) =")
         except Exception as e:
+            self.error_label.setStyleSheet("color: #FF4D4D; font-size: 11px; font-weight: bold;")
             self.error_label.setText(f"Error: {e}"); self.error_label.setVisible(True); return
 
         try:
-            xmin, xmax, dur = float(self.inp_xmin.text()), float(self.inp_xmax.text()), max(0.5, float(self.inp_dur.text()))
-        except ValueError:
-            self.error_label.setText("Error: Parameters must be numbers"); self.error_label.setVisible(True); return
-        if xmin >= xmax:
-            self.error_label.setText("Error: x min must be less than x max"); self.error_label.setVisible(True); return
+            val_min = parse_bound(self.inp_xmin.text(), 0.0)
+            val_max = parse_bound(self.inp_xmax.text(), 2.0 * np.pi)
+            dur = max(0.5, float(self.inp_dur.text()))
+        except Exception:
+            self.error_label.setText("Error: Bounds and duration must be valid numbers or math expressions (e.g. 2*pi)"); self.error_label.setVisible(True); return
+        if val_min >= val_max:
+            self.error_label.setText("Error: Range min must be less than max"); self.error_label.setVisible(True); return
 
         if text not in self.history:
             self.history.insert(0, text); self.combo_history.blockSignals(True)
             self.combo_history.clear(); self.combo_history.addItems(self.history); self.combo_history.blockSignals(False)
 
-        # 1-VARIABLE 2D GRAPH
-        if len(var_names) == 1:
-            xs = np.linspace(xmin, xmax, 2400)
+        # 1. POLAR FLOWER EQUATION (r = f(theta))
+        if mode == "POLAR":
+            lam_r = res["lam_r"]
+            latex_str = res["latex"]
+            th_vals = np.linspace(val_min, val_max, 2400)
+            with np.errstate(all="ignore"):
+                r_vals = lam_r(th_vals)
+                if np.isscalar(r_vals): r_vals = np.full_like(th_vals, float(r_vals))
+                xs = r_vals * np.cos(th_vals)
+                ys = r_vals * np.sin(th_vals)
+                xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+
+            span = max(float(np.nanmax(xs) - np.nanmin(xs)), float(np.nanmax(ys) - np.nanmin(ys)), 0.1)
+            lim = max(abs(float(np.nanmin(xs))), abs(float(np.nanmax(xs))), abs(float(np.nanmin(ys))), abs(float(np.nanmax(ys))))
+            lim = max(lim * 1.18, 0.5)
+
+            self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
+            self.audio_engine.prepare(ys, -lim, lim, dur)
+            self.animator.start_animation_trace(xs, ys, dur, self._unified_progress, self._on_anim_finish)
+
+        # 2. PARAMETRIC FLOWER / CURVE (x(t), y(t))
+        elif mode == "PARAMETRIC":
+            lam_x, lam_y = res["lam_x"], res["lam_y"]
+            latex_str = res["latex"]
+            t_vals = np.linspace(val_min, val_max, 2400)
+            with np.errstate(all="ignore"):
+                xs = lam_x(t_vals); ys = lam_y(t_vals)
+                if np.isscalar(xs): xs = np.full_like(t_vals, float(xs))
+                if np.isscalar(ys): ys = np.full_like(t_vals, float(ys))
+                xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
+
+            lim = max(abs(float(np.nanmin(xs))), abs(float(np.nanmax(xs))), abs(float(np.nanmin(ys))), abs(float(np.nanmax(ys)))) * 1.18
+            self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
+            self.audio_engine.prepare(ys, -lim, lim, dur)
+            self.animator.start_animation_trace(xs, ys, dur, self._unified_progress, self._on_anim_finish)
+
+        # 3. IMPLICIT 2D EQUATION (e.g. (x^2+y^2)^3 = 4x^2y^2 or x^2+y^2=1)
+        elif mode == "IMPLICIT_2D":
+            lam, latex_str = res["lam"], res["latex"]
+            b_val = max(abs(val_min), abs(val_max))
+            cx, cy = extract_2d_contour(lambda X, Y: lam(X, Y), -b_val, b_val, -b_val, b_val, 2400)
+            if cx is None:
+                self.error_label.setText("No real 2D contour found in this range. Try widening min/max bounds."); self.error_label.setVisible(True); return
+
+            valid_x, valid_y = cx[np.isfinite(cx)], cy[np.isfinite(cy)]
+            lim = max(abs(float(np.nanmin(valid_x))), abs(float(np.nanmax(valid_x))), abs(float(np.nanmin(valid_y))), abs(float(np.nanmax(valid_y)))) * 1.2
+            lim = max(lim, 0.5)
+
+            self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
+            self.audio_engine.prepare(cy, -lim, lim, dur)
+            self.animator.start_animation_trace(cx, cy, dur, self._unified_progress, self._on_anim_finish)
+
+        # 4. 3-VARIABLE 2D DYNAMIC SLICE (e.g. x^2+y^2+z^2=1)
+        elif mode == "SLICE_3D":
+            lam, latex_str = res["lam"], res["latex"]
+            slices: list[tuple[Optional[np.ndarray], Optional[np.ndarray]]] = []
+            z_levels = np.linspace(val_min, val_max, 45)
+            sound_values: list[float] = []
+            b_val = max(abs(val_min), abs(val_max))
+
+            for zv in z_levels:
+                F_slice = lambda X, Y, z_fixed=zv: lam(X, Y, z_fixed)
+                scx, scy = extract_2d_contour(F_slice, -b_val, b_val, -b_val, b_val, 300)
+                if scx is not None:
+                    slices.append((scx, scy))
+                    r_val = float(np.nanmean(np.sqrt(scx**2 + scy**2)))
+                    sound_values.append(r_val)
+                else:
+                    slices.append((None, None))
+                    sound_values.append(0.0)
+
+            lim = b_val * 1.2
+            self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
+            sound_arr = np.interp(np.linspace(0, 1, 2400), np.linspace(0, 1, len(sound_values)), sound_values)
+            self.audio_engine.prepare(sound_arr, 0.0, float(max(1e-4, max(sound_values))), dur)
+            self.animator.start_animation_slices(slices, dur, self._unified_progress, self._on_anim_finish)
+
+        # 5. CARTESIAN 1D FUNCTION (y = f(x))
+        else:
+            lam, latex_str = res["lam"], res["latex"]
+            xs = np.linspace(val_min, val_max, 2400)
             with np.errstate(all="ignore"):
                 ys = lam(np.where(xs == 0.0, 1e-12, xs))
                 if np.isscalar(ys): ys = np.full_like(xs, float(ys))
@@ -602,50 +835,9 @@ class MainWindow(QMainWindow):
             flips = (ys_plot[:-1] * ys_plot[1:]) < 0
             ys_plot[:-1][flips & (np.abs(np.diff(ys_plot)) > span * 0.6)] = np.nan
 
-            self.animator.setup_2d_axes(xmin, xmax, ymin, ymax, latex_str, equal_aspect=False)
+            self.animator.setup_2d_axes(val_min, val_max, ymin, ymax, latex_str, equal_aspect=False)
             self.audio_engine.prepare(ys, ymin, ymax, dur)
             self.animator.start_animation_trace(xs, ys_plot, dur, self._unified_progress, self._on_anim_finish)
-
-        # 2-VARIABLE 2D CONTOUR (Circle, Ellipse, Implicit Curves)
-        elif len(var_names) == 2:
-            F_wrap = lambda X, Y: lam(X, Y)
-            cx, cy = extract_2d_contour(F_wrap, xmin, xmax, xmin, xmax, 2400)
-            if cx is None:
-                self.error_label.setText("No real 2D contour found in this range. Try widening x min/max."); self.error_label.setVisible(True); return
-
-            valid_x, valid_y = cx[np.isfinite(cx)], cy[np.isfinite(cy)]
-            min_x, max_x = np.nanmin(valid_x), np.nanmax(valid_x)
-            min_y, max_y = np.nanmin(valid_y), np.nanmax(valid_y)
-            pad_x = max(0.5, (max_x - min_x) * 0.2)
-            pad_y = max(0.5, (max_y - min_y) * 0.2)
-            lim = max(max(abs(min_x - pad_x), abs(max_x + pad_x)), max(abs(min_y - pad_y), abs(max_y + pad_y)))
-
-            self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
-            self.audio_engine.prepare(cy, -lim, lim, dur)
-            self.animator.start_animation_trace(cx, cy, dur, self._unified_progress, self._on_anim_finish)
-
-        # 3-VARIABLE ANIMATED 2D SLICES (Evolving cross-sections over z)
-        else:
-            slices: list[tuple[Optional[np.ndarray], Optional[np.ndarray]]] = []
-            z_levels = np.linspace(xmin, xmax, 45)
-            sound_values: list[float] = []
-
-            for zv in z_levels:
-                F_slice = lambda X, Y, z_fixed=zv: lam(X, Y, z_fixed)
-                scx, scy = extract_2d_contour(F_slice, xmin, xmax, xmin, xmax, 300)
-                if scx is not None:
-                    slices.append((scx, scy))
-                    r_val = float(np.nanmean(np.sqrt(scx**2 + scy**2)))
-                    sound_values.append(r_val)
-                else:
-                    slices.append((None, None))
-                    sound_values.append(0.0)
-
-            lim = max(abs(xmin), abs(xmax)) * 1.2
-            self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
-            sound_arr = np.interp(np.linspace(0, 1, 2400), np.linspace(0, 1, len(sound_values)), sound_values)
-            self.audio_engine.prepare(sound_arr, 0.0, float(max(1e-4, max(sound_values))), dur)
-            self.animator.start_animation_slices(slices, dur, self._unified_progress, self._on_anim_finish)
 
         self.wall_clock_start, self.accumulated_pause = time.perf_counter(), 0.0
         self.btn_pause.setText("Pause")
@@ -679,7 +871,7 @@ class MainWindow(QMainWindow):
 
     def save_animation(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Video with Audio", "sound_of_math.mp4",
+            self, "Save Video with Audio", "mathematical_flower.mp4",
             "MP4 Video with Sound (*.mp4);;GIF Animation (*.gif)"
         )
         if not path: return
@@ -744,7 +936,6 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if hasattr(self, "keypad"):
-            # Keep keypad bounded inside the window during window resize
             pw, ph = self.width(), self.height()
             kx = min(self.keypad.x(), max(6, pw - self.keypad.width() - 8))
             ky = min(self.keypad.y(), max(50, ph - self.keypad.height() - 8))
