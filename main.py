@@ -58,6 +58,7 @@ class FormulaParser:
         s = text.strip()
         s = s.replace("θ", "theta").replace("\\theta", "theta")
         s = s.replace("×", "*").replace("÷", "/").replace("π", "pi").replace("−", "-").replace("²", "**2").replace("³", "**3")
+        s = s.replace(";", ",")
         s = re.sub(r"√\s*\(([^)]+)\)", r"sqrt(\1)", s)
         s = re.sub(r"√\s*([a-zA-Z0-9_]+)", r"sqrt(\1)", s)
         while r"\frac" in s:
@@ -76,19 +77,19 @@ class FormulaParser:
         """
         Classifies and parses user formula into one of:
         - POLAR: r = f(theta)
-        - PARAMETRIC: x = f(t), y = g(t)
+        - PARAMETRIC: x = f(t), y = g(t) or (f(t), g(t))
         - IMPLICIT_2D: f(x, y) = 0
         - SLICE_3D: f(x, y, z) = 0
         - CARTESIAN_1D: y = f(x)
         """
         raw = cls.preprocess_str(text)
         if not raw: raise ValueError("Formula cannot be empty")
-        if any(bad in raw for bad in [":", "__"]): raise ValueError("Forbidden syntax (: __)")
+        if "__" in raw: raise ValueError("Forbidden syntax (__)")
 
-        # 1. PARAMETRIC CHECK (x = ..., y = ...)
-        clean_param = raw.replace(";", ",").replace("\n", ",")
-        clean_param = re.sub(r"\b[Xx]\s*(?:equation\s*)?=", "x =", clean_param)
-        clean_param = re.sub(r"\b[Yy]\s*(?:equation\s*)?=", "y =", clean_param)
+        # 1. PARAMETRIC CHECK (explicit x = ..., y = ... or x(t) = ..., y(t) = ...)
+        clean_param = raw.replace("\n", ",")
+        clean_param = re.sub(r"\b[Xx]\s*(?:\([a-zA-Z0-9_,\s]*\))?\s*(?:equation)?\s*[:=]\s*", "x = ", clean_param)
+        clean_param = re.sub(r"\b[Yy]\s*(?:\([a-zA-Z0-9_,\s]*\))?\s*(?:equation)?\s*[:=]\s*", "y = ", clean_param)
         if ("x =" in clean_param or "x=" in clean_param) and ("y =" in clean_param or "y=" in clean_param):
             parts = [p.strip() for p in clean_param.split(",") if "=" in p]
             x_str, y_str = None, None
@@ -102,7 +103,8 @@ class FormulaParser:
                     if w not in cls.WORDS: raise ValueError(f"Unknown identifier '{w}'")
                 ex = parse_expr(x_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
                 ey = parse_expr(y_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
-                param = cls.T if cls.T in (ex.free_symbols | ey.free_symbols) else cls.THETA
+                free = ex.free_symbols | ey.free_symbols
+                param = cls.T if cls.T in free else (cls.THETA if cls.THETA in free else (cls.X if cls.X in free else cls.T))
                 lam_x = sp.lambdify(param, ex, modules=["numpy"])
                 lam_y = sp.lambdify(param, ey, modules=["numpy"])
                 lat_x = sp.latex(ex).replace(r"\left", "").replace(r"\right", "")
@@ -110,19 +112,29 @@ class FormulaParser:
                 latex_str = f"x({param.name})={lat_x}, y({param.name})={lat_y}"
                 return "PARAMETRIC", {"lam_x": lam_x, "lam_y": lam_y, "latex": latex_str, "param": param.name}
 
-        # 2. POLAR CHECK (r = ... or contains theta)
-        if raw.startswith("r =") or raw.startswith("r=") or "theta" in raw:
+        # 2. POLAR CHECK (r = ... or single expression containing theta without comma)
+        if raw.startswith("r =") or raw.startswith("r=") or ("theta" in raw and "," not in raw):
             r_str = raw.split("=", 1)[1].strip() if "=" in raw else raw
             for w in re.findall(r"[a-zA-Z_]\w*", r_str):
                 if w not in cls.WORDS: raise ValueError(f"Unknown identifier '{w}'")
             er = parse_expr(r_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
+            if isinstance(er, (tuple, list)):
+                if len(er) == 2:
+                    ex, ey = er[0], er[1]
+                    free = ex.free_symbols | ey.free_symbols
+                    param = cls.THETA if cls.THETA in free else (cls.T if cls.T in free else cls.X)
+                    lam_x = sp.lambdify(param, ex, modules=["numpy"])
+                    lam_y = sp.lambdify(param, ey, modules=["numpy"])
+                    lat_x = sp.latex(ex).replace(r"\left", "").replace(r"\right", "")
+                    lat_y = sp.latex(ey).replace(r"\left", "").replace(r"\right", "")
+                    return "PARAMETRIC", {"lam_x": lam_x, "lam_y": lam_y, "latex": f"x({param.name})={lat_x}, y({param.name})={lat_y}", "param": param.name}
             param = cls.THETA if (cls.THETA in er.free_symbols or cls.T not in er.free_symbols) else cls.T
             lam_r = sp.lambdify(param, er, modules=["numpy"])
             raw_lat = sp.latex(er).replace(r"\left", "").replace(r"\right", "")
             latex_str = f"r({param.name}) = {raw_lat}"
             return "POLAR", {"lam_r": lam_r, "latex": latex_str, "param": param.name}
 
-        # 3. EQUATION / IMPLICIT / CARTESIAN FORM
+        # 3. EQUATION / IMPLICIT / PARAMETRIC PAIR / CARTESIAN FORM
         eq_str = raw
         if "=" in eq_str:
             left, right = eq_str.split("=", 1)
@@ -137,6 +149,24 @@ class FormulaParser:
         for w in re.findall(r"[a-zA-Z_]\w*", eq_str):
             if w not in cls.WORDS: raise ValueError(f"Unknown identifier '{w}'")
         expr = parse_expr(eq_str, local_dict=cls.LOCAL_DICT, transformations=cls.TRANSFORMS)
+
+        # Handle tuple/list from comma-separated parametric pairs, e.g. cos(t), sin(0.99t) or (cos(t), sin(t))
+        if isinstance(expr, (tuple, list)):
+            if len(expr) == 2:
+                ex, ey = expr[0], expr[1]
+                free = ex.free_symbols | ey.free_symbols
+                param = cls.T if cls.T in free else (cls.THETA if cls.THETA in free else (cls.X if cls.X in free else cls.T))
+                lam_x = sp.lambdify(param, ex, modules=["numpy"])
+                lam_y = sp.lambdify(param, ey, modules=["numpy"])
+                lat_x = sp.latex(ex).replace(r"\left", "").replace(r"\right", "")
+                lat_y = sp.latex(ey).replace(r"\left", "").replace(r"\right", "")
+                latex_str = f"x({param.name})={lat_x}, y({param.name})={lat_y}"
+                return "PARAMETRIC", {"lam_x": lam_x, "lam_y": lam_y, "latex": latex_str, "param": param.name}
+            elif len(expr) == 1:
+                expr = expr[0]
+            else:
+                raise ValueError(f"Parametric input requires 2 expressions (x, y), got {len(expr)}")
+
         free = expr.free_symbols
 
         # 3-variable slice
@@ -528,6 +558,7 @@ class MainWindow(QMainWindow):
         ("Chirp", "sin(x^2)", "-6.0", "6.0"),
         ("Damped", "e^(x/4)*sin(6x)", "-6.0", "6.0"),
         ("Singular", "x*sin(1/x)", "-1.5", "1.5"),
+        ("Lissajous", "cos(t), sin(0.99t)", "0", "20*pi"),
         ("🔮 Sphere", "x^2+y^2+z^2-1", "-2.0", "2.0")
     ]
 
@@ -631,7 +662,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(ctrl_bar)
 
         act_bar = QHBoxLayout()
-        for name, handler in [("Pause", self.toggle_pause), ("Replay", self.replay), ("Mute 🔇", self.toggle_mute), ("Save MP4/GIF", self.save_animation)]:
+        for name, handler in [("Pause ⏸", self.toggle_pause), ("Replay ↺", self.replay), ("Mute 🔇", self.toggle_mute), ("Save MP4/GIF", self.save_animation)]:
             btn = QPushButton(name); btn.clicked.connect(handler); act_bar.addWidget(btn)
             if "Pause" in name: self.btn_pause = btn
             elif "Mute" in name: self.btn_mute = btn
@@ -684,9 +715,9 @@ class MainWindow(QMainWindow):
     def _on_formula_text_changed(self, text: str) -> None:
         """Dynamically updates the range labels depending on whether formula uses theta, t, or x."""
         t = text.lower()
-        if "theta" in t or "θ" in t or t.startswith("r =") or t.startswith("r="):
+        if re.search(r"(?<![a-zA-Z])(?:theta|θ)(?![a-zA-Z])", t) or t.startswith("r =") or t.startswith("r="):
             self.lbl_min.setText("θ min:"); self.lbl_max.setText("θ max:")
-        elif "t" in t and ("x=" in t or "y=" in t or "x =" in t or "y =" in t):
+        elif re.search(r"(?<![a-zA-Z])t(?![a-zA-Z])", t):
             self.lbl_min.setText("t min:"); self.lbl_max.setText("t max:")
         else:
             self.lbl_min.setText("x min:"); self.lbl_max.setText("x max:")
@@ -767,7 +798,11 @@ class MainWindow(QMainWindow):
                 if np.isscalar(ys): ys = np.full_like(t_vals, float(ys))
                 xs = np.asarray(xs, dtype=float); ys = np.asarray(ys, dtype=float)
 
+            if not np.any(np.isfinite(xs)) or not np.any(np.isfinite(ys)):
+                self.error_label.setText("Error: Parametric functions produced no finite values in this range."); self.error_label.setVisible(True); return
+
             lim = max(abs(float(np.nanmin(xs))), abs(float(np.nanmax(xs))), abs(float(np.nanmin(ys))), abs(float(np.nanmax(ys)))) * 1.18
+            lim = max(lim, 0.5)
             self.animator.setup_2d_axes(-lim, lim, -lim, lim, latex_str, equal_aspect=True)
             self.audio_engine.prepare(ys, -lim, lim, dur)
             self.animator.start_animation_trace(xs, ys, dur, self._unified_progress, self._on_anim_finish)
@@ -840,7 +875,7 @@ class MainWindow(QMainWindow):
             self.animator.start_animation_trace(xs, ys_plot, dur, self._unified_progress, self._on_anim_finish)
 
         self.wall_clock_start, self.accumulated_pause = time.perf_counter(), 0.0
-        self.btn_pause.setText("Pause")
+        self.btn_pause.setText("Pause ⏸")
 
     def _unified_progress(self) -> float:
         if self.audio_engine.stream and self.audio_engine.stream.active and self.audio_engine.is_playing:
@@ -849,21 +884,21 @@ class MainWindow(QMainWindow):
         return min(1.0, max(0.0, elapsed / self.animator.duration))
 
     def _on_anim_finish(self) -> None:
-        self.audio_engine.is_playing = False; self.btn_pause.setText("Replay")
+        self.audio_engine.is_playing = False; self.btn_pause.setText("Play ▶")
 
     def toggle_pause(self) -> None:
         if self._unified_progress() >= 1.0: self.replay(); return
         if not self.animator.is_paused:
             self.animator.is_paused, self.audio_engine.is_playing = True, False
-            self.pause_timestamp = time.perf_counter(); self.btn_pause.setText("Resume")
+            self.pause_timestamp = time.perf_counter(); self.btn_pause.setText("Resume ▶")
         else:
             self.animator.is_paused, self.audio_engine.is_playing = False, True
-            self.accumulated_pause += time.perf_counter() - self.pause_timestamp; self.btn_pause.setText("Pause")
+            self.accumulated_pause += time.perf_counter() - self.pause_timestamp; self.btn_pause.setText("Pause ⏸")
 
     def replay(self) -> None:
         self.audio_engine.set_progress(0.0); self.audio_engine.is_playing = True
         self.wall_clock_start, self.accumulated_pause = time.perf_counter(), 0.0
-        self.animator.is_paused = False; self.btn_pause.setText("Pause")
+        self.animator.is_paused = False; self.btn_pause.setText("Pause ⏸")
 
     def toggle_mute(self) -> None:
         self.audio_engine.is_muted = not self.audio_engine.is_muted
